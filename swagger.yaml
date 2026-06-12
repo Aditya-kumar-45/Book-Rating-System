@@ -1,0 +1,864 @@
+openapi: 3.0.3
+info:
+  title: Book Rating System API
+  version: 1.0.0
+  description: >
+    A secure REST API for managing books and ratings with role-based access control.
+    Supports JWT authentication via HttpOnly cookies, RBAC (admin/reader),
+    pagination, search, and Redis caching.
+  contact:
+    name: BookShelf Team
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local development server
+
+tags:
+  - name: Auth
+    description: Authentication & authorization endpoints
+  - name: Books
+    description: Book CRUD operations (admin-managed)
+  - name: Ratings
+    description: Book rating & review operations (reader-managed)
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: token
+      description: JWT token stored in an HttpOnly secure cookie
+
+  schemas:
+    # ── Request Bodies ──────────────────────────────────────────────
+    RegisterRequest:
+      type: object
+      required:
+        - username
+        - email
+        - password
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 30
+          example: johndoe
+        email:
+          type: string
+          format: email
+          example: john@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: Str0ng!Pass
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: john@example.com
+        password:
+          type: string
+          format: password
+          example: Str0ng!Pass
+
+    CreateBookRequest:
+      type: object
+      required:
+        - title
+        - author
+        - isbn
+      properties:
+        title:
+          type: string
+          example: The Great Gatsby
+        author:
+          type: string
+          example: F. Scott Fitzgerald
+        isbn:
+          type: string
+          example: "978-0743273565"
+        description:
+          type: string
+          example: A novel set in the Jazz Age on Long Island.
+        genre:
+          type: string
+          example: Fiction
+        published_year:
+          type: integer
+          example: 1925
+
+    UpdateBookRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        author:
+          type: string
+        isbn:
+          type: string
+        description:
+          type: string
+        genre:
+          type: string
+        published_year:
+          type: integer
+
+    CreateRatingRequest:
+      type: object
+      required:
+        - score
+      properties:
+        score:
+          type: integer
+          minimum: 1
+          maximum: 5
+          example: 4
+        review:
+          type: string
+          example: A beautifully written classic.
+
+    UpdateRatingRequest:
+      type: object
+      properties:
+        score:
+          type: integer
+          minimum: 1
+          maximum: 5
+          example: 5
+        review:
+          type: string
+          example: Updated — even better on a second reading!
+
+    # ── Response Bodies ─────────────────────────────────────────────
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        username:
+          type: string
+          example: johndoe
+        email:
+          type: string
+          format: email
+          example: john@example.com
+        role:
+          type: string
+          enum: [admin, reader]
+          example: reader
+        created_at:
+          type: string
+          format: date-time
+
+    Book:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        title:
+          type: string
+          example: The Great Gatsby
+        author:
+          type: string
+          example: F. Scott Fitzgerald
+        isbn:
+          type: string
+          example: "978-0743273565"
+        description:
+          type: string
+        genre:
+          type: string
+          example: Fiction
+        published_year:
+          type: integer
+          example: 1925
+        avg_rating:
+          type: number
+          format: float
+          example: 4.3
+        created_at:
+          type: string
+          format: date-time
+
+    Rating:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        user_id:
+          type: integer
+          example: 2
+        book_id:
+          type: integer
+          example: 1
+        score:
+          type: integer
+          minimum: 1
+          maximum: 5
+          example: 4
+        review:
+          type: string
+          example: A beautifully written classic.
+        username:
+          type: string
+          example: johndoe
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PaginatedResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Book"
+        pagination:
+          type: object
+          properties:
+            page:
+              type: integer
+              example: 1
+            limit:
+              type: integer
+              example: 10
+            totalItems:
+              type: integer
+              example: 42
+            totalPages:
+              type: integer
+              example: 5
+            hasNextPage:
+              type: boolean
+              example: true
+            hasPrevPage:
+              type: boolean
+              example: false
+
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: Validation error
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+        data:
+          type: object
+
+# ═══════════════════════════════════════════════════════════════════
+# PATHS
+# ═══════════════════════════════════════════════════════════════════
+paths:
+  # ── Auth ────────────────────────────────────────────────────────
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      description: Creates a new user account with the **reader** role by default.
+      operationId: registerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: User registered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: User registered successfully
+                  data:
+                    $ref: "#/components/schemas/User"
+        "400":
+          description: Validation error (missing/invalid fields)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Email or username already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in an existing user
+      description: >
+        Authenticates the user and sets a JWT inside an **HttpOnly** cookie
+        named `token`.
+      operationId: loginUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful — HttpOnly cookie set
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: token=eyJhbGci...; HttpOnly; Path=/; Max-Age=900
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Login successful
+                  data:
+                    $ref: "#/components/schemas/User"
+        "401":
+          description: Invalid email or password
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out the current user
+      description: Clears the authentication cookie.
+      operationId: logoutUser
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Logged out — cookie cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Logged out successfully
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current user profile
+      description: Returns the profile of the currently authenticated user.
+      operationId: getCurrentUser
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: "#/components/schemas/User"
+        "401":
+          description: Not authenticated — missing or expired token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Books ───────────────────────────────────────────────────────
+  /books:
+    get:
+      tags: [Books]
+      summary: List all books (paginated)
+      description: >
+        Returns a paginated list of books with their average ratings.
+        Supports search by title/author and filtering by genre.
+      operationId: listBooks
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 100
+          description: Items per page
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Search by title or author (case-insensitive)
+        - name: genre
+          in: query
+          schema:
+            type: string
+          description: Filter by genre
+      responses:
+        "200":
+          description: Paginated book list with average ratings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedResponse"
+
+    post:
+      tags: [Books]
+      summary: Create a new book
+      description: "**Admin only.** Adds a new book to the catalogue."
+      operationId: createBook
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBookRequest"
+      responses:
+        "201":
+          description: Book created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Book created successfully
+                  data:
+                    $ref: "#/components/schemas/Book"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not authorized — admin role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /books/{id}:
+    get:
+      tags: [Books]
+      summary: Get a single book
+      description: Returns a single book by ID, including its average rating.
+      operationId: getBookById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+      responses:
+        "200":
+          description: Book details with average rating
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: "#/components/schemas/Book"
+        "404":
+          description: Book not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    put:
+      tags: [Books]
+      summary: Update a book
+      description: "**Admin only.** Updates one or more fields of an existing book."
+      operationId: updateBook
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateBookRequest"
+      responses:
+        "200":
+          description: Book updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Book updated successfully
+                  data:
+                    $ref: "#/components/schemas/Book"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not authorized — admin role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Book not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    delete:
+      tags: [Books]
+      summary: Delete a book
+      description: "**Admin only.** Permanently removes a book and its associated ratings."
+      operationId: deleteBook
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+      responses:
+        "200":
+          description: Book deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Book deleted successfully
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not authorized — admin role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Book not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Ratings ─────────────────────────────────────────────────────
+  /books/{bookId}/ratings:
+    get:
+      tags: [Ratings]
+      summary: Get all ratings for a book
+      description: Returns every rating and review for the specified book.
+      operationId: getBookRatings
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+      responses:
+        "200":
+          description: List of ratings for the book
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Rating"
+        "404":
+          description: Book not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      tags: [Ratings]
+      summary: Submit a rating for a book
+      description: >
+        **Reader only.** Submits a rating (1–5) with an optional text review.
+        Each user may rate a book only once.
+      operationId: createRating
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRatingRequest"
+      responses:
+        "201":
+          description: Rating created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Rating submitted successfully
+                  data:
+                    $ref: "#/components/schemas/Rating"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not authorized — reader role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: User has already rated this book
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /books/{bookId}/ratings/{id}:
+    put:
+      tags: [Ratings]
+      summary: Update a rating
+      description: "**Owner only.** Updates the authenticated user's own rating."
+      operationId: updateRating
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Rating ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRatingRequest"
+      responses:
+        "200":
+          description: Rating updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Rating updated successfully
+                  data:
+                    $ref: "#/components/schemas/Rating"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not authorized — must be rating owner
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Rating not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    delete:
+      tags: [Ratings]
+      summary: Delete a rating
+      description: "**Owner or Admin.** Removes a rating permanently."
+      operationId: deleteRating
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Book ID
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Rating ID
+      responses:
+        "200":
+          description: Rating deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Rating deleted successfully
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not authorized — must be owner or admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Rating not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
